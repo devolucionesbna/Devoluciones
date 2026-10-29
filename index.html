@@ -5,8 +5,8 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <meta name="theme-color" content="#1f3a5f">
 <title>Averías y devoluciones PDV</title>
-<!-- Lector de códigos de barras (usa la cámara; requiere https) -->
-<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<!-- Lector de códigos de barras ZXing (respaldo cuando el celular no trae lector nativo; requiere https para la cámara) -->
+<script src="https://unpkg.com/@zxing/library@0.21.3/umd/index.min.js"></script>
 <style>
   :root { --az:#1f3a5f; --vd:#15803d; --rj:#b91c1c; --am:#b45309; --gr:#6b7280; --fondo:#f3f4f6; }
   * { box-sizing:border-box; }
@@ -37,7 +37,12 @@
   .opcion:active { background:#eef2ff; }
   .radio { display:flex; gap:8px; } .radio button { margin-top:6px; }
   .radio button.sel { outline:3px solid var(--az); }
-  #lector { width:100%; border-radius:10px; overflow:hidden; margin-top:8px; }
+  #lector { position:relative; width:100%; border-radius:10px; overflow:hidden; margin-top:8px; background:#000; }
+  #lector video { width:100%; display:block; max-height:55vh; object-fit:cover; }
+  #guia { position:absolute; left:8%; right:8%; top:50%; height:34%; transform:translateY(-50%); border:3px solid rgba(255,255,255,.9); border-radius:10px; box-shadow:0 0 0 999px rgba(0,0,0,.35); pointer-events:none; }
+  #guia::after { content:''; position:absolute; left:4%; right:4%; top:50%; border-top:2px solid #ef4444; }
+  #camEstado { position:absolute; left:0; right:0; bottom:6px; text-align:center; color:#fff; font-size:13px; text-shadow:0 1px 2px #000; }
+  #camBotones { display:flex; gap:8px; } #camBotones button { margin-top:8px; }
   .modal { position:fixed; inset:0; background:rgba(0,0,0,.45); display:flex; align-items:flex-end; justify-content:center; z-index:20; }
   .modal .card { width:100%; max-width:560px; margin:0; border-radius:16px 16px 0 0; padding-bottom:24px; }
   .total { font-size:15px; margin-top:8px; text-align:right; }
@@ -98,9 +103,13 @@
     <div class="pasos">Paso 4 de 5 · <span id="pdvActual"></span></div>
     <div class="card">
       <h2>Agregar producto</h2>
-      <button class="ok" id="bEscanear">Escanear código de barras</button>
-      <div id="lector" class="oculto"></div>
-      <button class="sec oculto" id="bCerrarCam">Cerrar cámara</button>
+      <div class="fila">
+        <button class="ok" id="bEscanear">Escanear</button>
+        <button class="sec" id="bFoto">Tomar foto del código</button>
+      </div>
+      <input id="inFoto" type="file" accept="image/*" capture="environment" class="oculto">
+      <div id="lector" class="oculto"><video id="video" playsinline muted autoplay></video><div id="guia"></div><div id="camEstado">Ubica el código dentro del recuadro, a 10–15 cm</div></div>
+      <div id="camBotones" class="oculto"><button class="sec" id="bLinterna" style="display:none">Linterna</button><button class="sec" id="bCerrarCam">Cerrar cámara</button></div>
       <div class="fila" style="margin-top:6px">
         <input id="txtCodigo" inputmode="numeric" placeholder="O escribe el código">
         <button class="sec" id="bCodigo" style="flex:0 0 90px;margin-top:0">Buscar</button>
@@ -176,7 +185,6 @@ let porEan = {};            // ean -> [índices maestra]
 let B = null;               // borrador de la relación actual
 let productoEnFicha = null; // producto mostrado para pedir unidades
 let codigoNoEncontrado = '';
-let escaner = null;
 
 /* Almacenamiento local protegido (algunos navegadores lo bloquean) */
 const LS = {
@@ -310,26 +318,165 @@ function pintarLista() {
   $('bSinNovedad').classList.toggle('oculto', B.lineas.length > 0);
 }
 
-/* --- Cámara --- */
+/* --- Cámara ---
+   1) Si el celular trae lector nativo (BarcodeDetector, Android/Chrome): se usa ese, es el más rápido.
+   2) Si no (iPhone y otros): ZXing analiza la franja central del video en alta resolución.
+   3) Respaldo: "Tomar foto del código" usa la cámara normal del celular (con enfoque) y lee la foto.
+   Se valida el dígito de control EAN/UPC para no aceptar lecturas erradas. */
+const FORMATOS_NATIVOS = ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'itf'];
+let cam = null; // { stream, track, timer, detector, zx, ultimo, repeticiones }
+
+function digitoControlOk(c) {
+  if (!/^\d+$/.test(c)) return false;
+  if (![8, 12, 13, 14].includes(c.length)) return true; // otros formatos (Code 128, etc.) no llevan este control
+  let s = 0;
+  for (let i = c.length - 2, peso = 3; i >= 0; i--, peso = peso === 3 ? 1 : 3) s += Number(c[i]) * peso;
+  return (10 - (s % 10)) % 10 === Number(c[c.length - 1]);
+}
+
+async function crearDetectorNativo() {
+  if (!('BarcodeDetector' in window)) return null;
+  try {
+    const sop = await BarcodeDetector.getSupportedFormats();
+    const f = FORMATOS_NATIVOS.filter(x => sop.includes(x));
+    return f.includes('ean_13') ? new BarcodeDetector({ formats: f }) : null;
+  } catch (e) { return null; }
+}
+
+function crearLectorZXing() {
+  if (!window.ZXing) return null;
+  const hints = new Map(), F = ZXing.BarcodeFormat;
+  hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [F.EAN_13, F.EAN_8, F.UPC_A, F.UPC_E, F.CODE_128, F.ITF]);
+  hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
+  const r = new ZXing.MultiFormatReader(); r.setHints(hints); return r;
+}
+
+/* Lee un código de un canvas con ZXing. Devuelve el texto o null. */
+function leerCanvasZXing(zx, canvas) {
+  try {
+    const fuente = new ZXing.HTMLCanvasElementLuminanceSource(canvas);
+    const bmp = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(fuente));
+    return zx.decode(bmp).getText();
+  } catch (e) { return null; } finally { try { zx.reset(); } catch (e) {} }
+}
+
 $('bEscanear').onclick = async () => {
   limpiarPaneles();
-  if (!window.Html5Qrcode) return mostrarError('err4', 'No cargó el lector. Escribe el código a mano.');
-  $('lector').classList.remove('oculto'); $('bCerrarCam').classList.remove('oculto'); $('bEscanear').classList.add('oculto');
-  const F = Html5QrcodeSupportedFormats;
-  escaner = new Html5Qrcode('lector', { formatsToSupport: [F.EAN_13, F.EAN_8, F.UPC_A, F.UPC_E, F.CODE_128, F.ITF], verbose: false,
-    experimentalFeatures: { useBarCodeDetectorIfSupported: true } });
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia)
+    return mostrarError('err4', 'Este navegador no permite usar la cámara. Usa "Tomar foto del código" o escribe el código.');
   try {
-    await escaner.start({ facingMode: 'environment' }, { fps: 12, qrbox: { width: 280, height: 140 } },
-      txt => { if (navigator.vibrate) navigator.vibrate(120); cerrarCamara(); buscarCodigo(txt); }, () => {});
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: {
+      facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } } });
+    const track = stream.getVideoTracks()[0];
+    // Enfoque continuo y algo de zoom cuando el celular lo permite (ayuda mucho con códigos de barras)
+    try {
+      const cap = track.getCapabilities ? track.getCapabilities() : {}, adv = {};
+      if (cap.focusMode && cap.focusMode.includes('continuous')) adv.focusMode = 'continuous';
+      if (cap.zoom && cap.zoom.max >= 1.5) adv.zoom = Math.min(2, cap.zoom.max);
+      if (Object.keys(adv).length) await track.applyConstraints({ advanced: [adv] });
+      $('bLinterna').style.display = cap.torch ? '' : 'none';
+    } catch (e) {}
+    const video = $('video'); video.srcObject = stream; await video.play();
+    cam = { stream, track, detector: await crearDetectorNativo(), zx: null, ultimo: '', repeticiones: 0, linterna: false };
+    if (!cam.detector) {
+      cam.zx = crearLectorZXing();
+      if (!cam.zx) { cerrarCamara(); return mostrarError('err4', 'No cargó el lector. Usa "Tomar foto del código" o escribe el código.'); }
+    }
+    $('lector').classList.remove('oculto'); $('camBotones').classList.remove('oculto');
+    $('bEscanear').parentElement.classList.add('oculto');
+    $('camEstado').textContent = 'Ubica el código dentro del recuadro, a 10–15 cm';
+    cicloLectura();
   } catch (e) {
     cerrarCamara();
-    mostrarError('err4', 'No se pudo abrir la cámara. Da permiso de cámara al navegador o escribe el código.');
+    mostrarError('err4', e && e.name === 'NotAllowedError'
+      ? 'Bloqueaste la cámara. Habilítala en los permisos del navegador para este sitio, o usa "Tomar foto del código".'
+      : 'No se pudo abrir la cámara. Usa "Tomar foto del código" o escribe el código.');
   }
+};
+
+const lienzo = document.createElement('canvas');
+async function cicloLectura() {
+  if (!cam) return;
+  const v = $('video');
+  let codigo = null;
+  try {
+    if (v.readyState >= 2 && v.videoWidth) {
+      if (cam.detector) {
+        const r = await cam.detector.detect(v);
+        const ok = r.map(x => x.rawValue).find(digitoControlOk);
+        if (ok) codigo = ok;
+      } else {
+        // Franja central horizontal (donde está el recuadro), escalada a máx. 1280 px de ancho
+        const fw = v.videoWidth, fh = v.videoHeight, alto = Math.round(fh * 0.4);
+        const esc = Math.min(1, 1280 / fw);
+        lienzo.width = Math.round(fw * esc); lienzo.height = Math.round(alto * esc);
+        lienzo.getContext('2d', { willReadFrequently: true }).drawImage(v, 0, (fh - alto) / 2, fw, alto, 0, 0, lienzo.width, lienzo.height);
+        const t = leerCanvasZXing(cam.zx, lienzo);
+        // ZXing: se exige la misma lectura dos veces seguidas para evitar errores
+        if (t && digitoControlOk(t)) {
+          if (t === cam.ultimo) cam.repeticiones++; else { cam.ultimo = t; cam.repeticiones = 1; }
+          if (cam.repeticiones >= 2) codigo = t;
+        }
+      }
+    }
+  } catch (e) {}
+  if (!cam) return;
+  if (codigo) {
+    if (navigator.vibrate) navigator.vibrate(120);
+    cerrarCamara(); buscarCodigo(codigo); return;
+  }
+  cam.timer = setTimeout(cicloLectura, cam.detector ? 120 : 60);
+}
+
+$('bLinterna').onclick = async () => {
+  if (!cam) return;
+  try { cam.linterna = !cam.linterna; await cam.track.applyConstraints({ advanced: [{ torch: cam.linterna }] }); } catch (e) {}
 };
 $('bCerrarCam').onclick = cerrarCamara;
 function cerrarCamara() {
-  if (escaner) { const e = escaner; escaner = null; e.stop().then(() => e.clear()).catch(() => {}); }
-  $('lector').classList.add('oculto'); $('bCerrarCam').classList.add('oculto'); $('bEscanear').classList.remove('oculto');
+  if (cam) { clearTimeout(cam.timer); cam.stream.getTracks().forEach(t => t.stop()); cam = null; }
+  try { $('video').srcObject = null; } catch (e) {}
+  $('lector').classList.add('oculto'); $('camBotones').classList.add('oculto');
+  $('bEscanear').parentElement.classList.remove('oculto');
+}
+
+/* --- Respaldo: foto con la cámara normal del celular --- */
+$('bFoto').onclick = () => { limpiarPaneles(); $('inFoto').value = ''; $('inFoto').click(); };
+$('inFoto').onchange = async () => {
+  const f = $('inFoto').files[0]; if (!f) return;
+  mostrarError('err4', '');
+  $('bFoto').disabled = true; $('bFoto').textContent = 'Leyendo foto…';
+  try {
+    const codigo = await leerFoto(f);
+    if (codigo) buscarCodigo(codigo);
+    else mostrarError('err4', 'No se pudo leer el código en la foto. Tómala de cerca, con buena luz, que el código salga derecho y nítido; o escríbelo.');
+  } finally { $('bFoto').disabled = false; $('bFoto').textContent = 'Tomar foto del código'; }
+};
+
+async function leerFoto(archivo) {
+  const url = URL.createObjectURL(archivo);
+  try {
+    const img = new Image(); img.src = url; await img.decode();
+    const det = await crearDetectorNativo();
+    if (det) {
+      try { const r = await det.detect(img); const ok = r.map(x => x.rawValue).find(digitoControlOk); if (ok) return ok; } catch (e) {}
+    }
+    const zx = crearLectorZXing(); if (!zx) return null;
+    // Se prueba la imagen completa a dos tamaños y girada 90° (por si la foto quedó vertical)
+    for (const ancho of [1600, 1000]) {
+      for (const giro of [0, 90]) {
+        const c = document.createElement('canvas'), esc = Math.min(1, ancho / Math.max(img.width, img.height));
+        const w = Math.round(img.width * esc), h = Math.round(img.height * esc);
+        c.width = giro ? h : w; c.height = giro ? w : h;
+        const ctx = c.getContext('2d');
+        if (giro) { ctx.translate(c.width, 0); ctx.rotate(Math.PI / 2); }
+        ctx.drawImage(img, 0, 0, w, h);
+        const t = leerCanvasZXing(zx, c);
+        if (t && digitoControlOk(t)) return t;
+      }
+    }
+    return null;
+  } finally { URL.revokeObjectURL(url); }
 }
 
 $('bCodigo').onclick = () => buscarCodigo($('txtCodigo').value);
